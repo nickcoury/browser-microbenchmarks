@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Inter-Thread Communication Chaos Matrix — Browser Microbenchmarks</title>
+  <link rel="stylesheet" href="../css/style.css">
+  <style>
+    .matrix-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin: 1rem 0; }
+    .matrix-table th, .matrix-table td { padding: 0.5rem 0.6rem; border: 1px solid var(--border); text-align: center; }
+    .matrix-table th { background: var(--surface-2); color: var(--text-muted); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; }
+    .matrix-table td:first-child, .matrix-table th:first-child { text-align: left; font-weight: 600; }
+    .matrix-table .approach-name { color: var(--accent); }
+    .matrix-table .size-label { color: var(--text-muted); font-weight: 400; font-size: 0.75rem; display: block; }
+    .cell-value { font-family: var(--mono); font-weight: 600; }
+    .cell-suffix { font-size: 0.7rem; color: var(--text-muted); }
+    .heat-fast { background: rgba(63,185,80,0.18); color: #3fb950; }
+    .heat-mid { background: rgba(217,163,25,0.15); color: #d9a319; }
+    .heat-slow { background: rgba(248,81,73,0.15); color: #f85149; }
+    .heat-na { background: var(--surface-2); color: var(--text-muted); font-style: italic; }
+    .controls-group { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+    .control { display: flex; flex-direction: column; gap: 0.3rem; }
+    .control label { font-size: 0.8rem; color: var(--text-muted); font-weight: 600; }
+    .control select { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 0.35rem 0.6rem; border-radius: 4px; font-size: 0.85rem; }
+    .progress-bar { width: 100%; height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; margin: 0.5rem 0; }
+    .progress-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.2s; }
+    .legend { display: flex; gap: 1rem; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem; flex-wrap: wrap; }
+    .legend span { display: inline-flex; align-items: center; gap: 0.3rem; }
+    .swatch { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+  </style>
+</head>
+<body class="benchmark-page">
+  <header>
+    <div class="container">
+      <h1>🔬 Browser Microbenchmarks</h1>
+    </div>
+  </header>
+
+  <main class="container">
+    <a href="../index.html" class="back-link">← Back to all benchmarks</a>
+    <h2>Inter-Thread Communication Chaos Matrix</h2>
+
+    <section class="description">
+      <p>
+        Measures round-trip throughput between main thread and a Web Worker under increasing concurrency.
+        Simulates the worst-case anti-pattern: <strong>N independent code modules all firing uncoordinated
+        bidirectional messages</strong> (e.g., measuring DOM rects and shipping state back to a worker).
+        Each round-trip modifies data on both sides.
+      </p>
+    </section>
+
+    <section class="config-panel">
+      <div class="controls-group">
+        <div class="control">
+          <label>Test Duration (ms)</label>
+          <select id="duration">
+            <option value="500">500 ms</option>
+            <option value="1000" selected>1000 ms</option>
+            <option value="2000">2000 ms</option>
+            <option value="3000">3000 ms</option>
+          </select>
+        </div>
+        <div class="control">
+          <label>Payload</label>
+          <select id="payload-mode">
+            <option value="both" selected>Both sizes</option>
+            <option value="small">1 KB only</option>
+            <option value="large">1 MB only</option>
+          </select>
+        </div>
+        <div class="control">
+          <label>Max Concurrency</label>
+          <select id="max-concurrency">
+            <option value="10">1, 10</option>
+            <option value="50" selected>1, 10, 50</option>
+            <option value="100">1, 10, 50, 100</option>
+          </select>
+        </div>
+      </div>
+      <div class="controls">
+        <button id="run-btn" class="btn">Run Benchmark</button>
+        <button id="clear-btn" class="btn btn-secondary">Clear Results</button>
+      </div>
+      <div class="progress-bar"><div id="progress-fill" class="progress-fill"></div></div>
+      <div id="status" style="font-size:0.8rem;color:var(--text-muted);min-height:1.2rem;"></div>
+    </section>
+
+    <div id="results"></div>
+
+    <div class="legend">
+      <span><span class="swatch heat-fast"></span> Fast (&gt;10k rt/s)</span>
+      <span><span class="swatch heat-mid"></span> Moderate (1k–10k rt/s)</span>
+      <span><span class="swatch heat-slow"></span> Slow (&lt;1k rt/s)</span>
+      <span><span class="swatch heat-na"></span> N/A (not supported)</span>
+    </div>
+
+    <section class="methodology" style="margin-top:2rem;">
+      <h3>Methodology</h3>
+      <ul style="margin-left:1.25rem;color:var(--text-muted);font-size:0.88rem;">
+        <li><strong>Round-trip</strong> = main sends data → worker modifies → worker replies → main receives.</li>
+        <li><strong>Sequential</strong> (concurrency=1): one caller awaits each round-trip before starting the next.</li>
+        <li><strong>Chaos</strong> (concurrency=N): N independent loops each fire round-trips as fast as possible for the duration.</li>
+        <li><strong>1 KB payload:</strong> object with a 1 KB Uint8Array; worker touches every byte.</li>
+        <li><strong>1 MB payload:</strong> object with a 1 MB Uint8Array; worker touches header + 16 samples.</li>
+        <li><strong>Transferable:</strong> ArrayBuffer ownership moves each direction (main→worker→main).</li>
+        <li><strong>SAB</strong> requires cross-origin isolation headers (not present on GitHub Pages) — shown as N/A if unavailable.</li>
+      </ul>
+    </section>
+
+    <pre id="log" class="log"></pre>
+  </main>
+
+  <footer>
+    <div class="container">
+      <p><a href="https://github.com/nickcoury/browser-microbenchmarks">Source on GitHub</a></p>
+    </div>
+  </footer>
+
+<script>
+// ===================== Inline Worker =====================
+const WORKER_CODE = `
+const ports = new Map();
+let bc = null;
+let sab = null;
+let sabMeta = null;
+let sabSlotSize = 0;
+let sabCount = 0;
+
+self.onmessage = function(e) {
+  const d = e.data;
+  if (d.cmd === 'init-port') {
+    const port = d.port;
+    const pid = d.portId;
+    ports.set(pid, port);
+    port.onmessage = ev => handleRequest(ev.data, port);
+    return;
+  }
+  if (d.cmd === 'init-bc') {
+    bc = new BroadcastChannel(d.channel);
+    bc.onmessage = ev => handleRequest(ev.data, 'bc');
+    return;
+  }
+  if (d.cmd === 'init-sab') {
+    sab = d.sab;
+    sabSlotSize = d.slotSize;
+    sabCount = d.count;
+    return;
+  }
+  if (d.cmd === 'init-sab-atomics') {
+    sab = d.sab;
+    sabMeta = new Int32Array(d.meta);
+    sabSlotSize = d.slotSize;
+    sabCount = d.count;
+    startAtomicLoop();
+    return;
+  }
+  if (d.type) handleRequest(d, 'self');
+};
+
+function handleRequest(data, replyTarget) {
+  const { type, id, payload, offset, size } = data;
+  let result = payload;
+
+  if (type === 'structured-clone') {
+    if (result && result.buffer) modifyBuffer(result.buffer, size);
+    result = { ...result, counter: (result.counter || 0) + 1 };
+  } else if (type === 'transferable') {
+    modifyBuffer(result, size);
+  } else if (type === 'sab-postmessage') {
+    if (sab) {
+      const view = new Uint8Array(sab, offset, size);
+      modifyBuffer(view, size);
+    }
+  }
+
+  const response = { id, payload: result };
+  const transfer = (type === 'transferable' && result instanceof ArrayBuffer) ? [result] : [];
+
+  if (replyTarget === 'bc') bc.postMessage(response);
+  else if (replyTarget === 'self') self.postMessage(response, transfer);
+  else replyTarget.postMessage(response, transfer);
+}
+
+function modifyBuffer(buf, size) {
+  const view = (buf instanceof ArrayBuffer) ? new Uint8Array(buf) : buf;
+  if (size <= 1024) {
+    for (let i = 0; i < view.length; i++) view[i] = (view[i] + 1) % 256;
+  } else {
+    const step = Math.max(1, Math.floor(view.length / 16));
+    for (let i = 0; i < view.length; i += step) view[i] = (view[i] + 1) % 256;
+    for (let i = 0; i < Math.min(1024, view.length); i += 64) view[i] = (view[i] + 1) % 256;
+  }
+}
+
+function startAtomicLoop() {
+  (async function loop() {
+    while (true) {
+      let didWork = false;
+      for (let i = 0; i < sabCount; i++) {
+        if (Atomics.load(sabMeta, i) === 1) {
+          const off = i * sabSlotSize;
+          modifyBuffer(new Uint8Array(sab, off, sabSlotSize), sabSlotSize);
+          Atomics.store(sabMeta, i + sabCount, 1);
+          Atomics.notify(sabMeta, i + sabCount, 1);
+          Atomics.store(sabMeta, i, 0);
+          didWork = true;
+        }
+      }
+      if (!didWork) await new Promise(r => setTimeout(r, 0));
+    }
+  })();
+}
+`;
+
+const workerBlob = new Blob([WORKER_CODE], { type: 'application/javascript' });
+const workerUrl = URL.createObjectURL(workerBlob);
+
+// ===================== Feature Detection =====================
+const hasSAB = typeof SharedArrayBuffer !== 'undefined';
+const hasSABA = hasSAB && typeof Atomics !== 'undefined' && typeof Atomics.waitAsync === 'function';
+const hasBC = typeof BroadcastChannel !== 'undefined';
+
+function log(msg) {
+  const el = document.getElementById('log');
+  el.textContent += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+  console.log(msg);
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+function setProgress(pct) {
+  document.getElementById('progress-fill').style.width = pct + '%';
+}
+
+// ===================== Payload Builders =====================
+function makeSmallPayload() {
+  return { counter: 0, ts: performance.now(), buffer: new Uint8Array(1024 - 64) };
+}
+function makeLargePayload() {
+  return { counter: 0, ts: performance.now(), meta: { v: 1 }, buffer: new Uint8Array(1024 * 1024 - 64) };
+}
+function makeSmallBuffer() { return new ArrayBuffer(1024); }
+function makeLargeBuffer() { return new ArrayBuffer(1024 * 1024); }
+function fillRandom(view) {
+  for (let i = 0; i < view.length; i++) view[i] = (i * 7 + 13) % 256;
+}
+
+// ===================== Approach Implementations =====================
+class Approach {
+  constructor(name) { this.name = name; }
+  async setup(concurrency, size) { }
+  async teardown() { }
+  async roundTrip(slotIndex, size) { throw new Error('implement'); }
+}
+
+class StructuredClone extends Approach {
+  async setup(c, size) {
+    this.worker = new Worker(workerUrl);
+    this.size = size;
+    this.pending = new Map();
+    this.worker.onmessage = e => {
+      const cb = this.pending.get(e.data.id);
+      if (cb) { this.pending.delete(e.data.id); cb(e.data.payload); }
+    };
+  }
+  async teardown() { this.worker.terminate(); }
+  roundTrip(slotIndex, size) {
+    return new Promise(resolve => {
+      const id = ++this._id || (this._id = 1);
+      this.pending.set(id, resolve);
+      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+      fillRandom(new Uint8Array(payload.buffer));
+      this.worker.postMessage({ type: 'structured-clone', id, payload, size });
+    });
+  }
+}
+
+class Transferable extends Approach {
+  async setup(c, size) {
+    this.worker = new Worker(workerUrl);
+    this.size = size;
+    this.pending = new Map();
+    this.worker.onmessage = e => {
+      const cb = this.pending.get(e.data.id);
+      if (cb) { this.pending.delete(e.data.id); cb(e.data.payload); }
+    };
+  }
+  async teardown() { this.worker.terminate(); }
+  roundTrip(slotIndex, size) {
+    return new Promise(resolve => {
+      const id = ++this._id || (this._id = 1);
+      this.pending.set(id, resolve);
+      const payload = size <= 1024 ? makeSmallBuffer() : makeLargeBuffer();
+      fillRandom(new Uint8Array(payload));
+      this.worker.postMessage({ type: 'transferable', id, payload, size }, [payload]);
+    });
+  }
+}
+
+class MessageChannelApproach extends Approach {
+  async setup(c, size) {
+    this.worker = new Worker(workerUrl);
+    this.size = size;
+    this.ports = [];
+    this.pending = [];
+    for (let i = 0; i < c; i++) {
+      const mc = new MessageChannel();
+      this.worker.postMessage({ cmd: 'init-port', port: mc.port2, portId: i }, [mc.port2]);
+      const pend = new Map();
+      this.pending.push(pend);
+      mc.port1.onmessage = e => {
+        const cb = pend.get(e.data.id);
+        if (cb) { pend.delete(e.data.id); cb(e.data.payload); }
+      };
+      this.ports.push(mc.port1);
+    }
+  }
+  async teardown() { this.worker.terminate(); }
+  roundTrip(slotIndex, size) {
+    return new Promise(resolve => {
+      const port = this.ports[slotIndex % this.ports.length];
+      const pend = this.pending[slotIndex % this.pending.length];
+      const id = ++this._id || (this._id = 1);
+      pend.set(id, resolve);
+      if (size <= 1024) {
+        const payload = makeSmallPayload();
+        fillRandom(new Uint8Array(payload.buffer));
+        port.postMessage({ type: 'structured-clone', id, payload, size });
+      } else {
+        const payload = makeLargePayload();
+        fillRandom(new Uint8Array(payload.buffer));
+        port.postMessage({ type: 'structured-clone', id, payload, size });
+      }
+    });
+  }
+}
+
+class BroadcastChannelApproach extends Approach {
+  async setup(c, size) {
+    if (!hasBC) return;
+    this.channel = 'bmc-' + Math.random().toString(36).slice(2);
+    this.worker = new Worker(workerUrl);
+    this.worker.postMessage({ cmd: 'init-bc', channel: this.channel });
+    this.size = size;
+    this.pending = new Map();
+    this.bc = new BroadcastChannel(this.channel);
+    this.bc.onmessage = e => {
+      const cb = this.pending.get(e.data.id);
+      if (cb) { this.pending.delete(e.data.id); cb(e.data.payload); }
+    };
+  }
+  async teardown() {
+    if (this.bc) this.bc.close();
+    if (this.worker) this.worker.terminate();
+  }
+  roundTrip(slotIndex, size) {
+    return new Promise(resolve => {
+      const id = ++this._id || (this._id = 1);
+      this.pending.set(id, resolve);
+      if (size <= 1024) {
+        const payload = makeSmallPayload();
+        fillRandom(new Uint8Array(payload.buffer));
+        this.bc.postMessage({ type: 'structured-clone', id, payload, size });
+      } else {
+        const payload = makeLargePayload();
+        fillRandom(new Uint8Array(payload.buffer));
+        this.bc.postMessage({ type: 'structured-clone', id, payload, size });
+      }
+    });
+  }
+}
+
+class SABPostMessage extends Approach {
+  async setup(c, size) {
+    if (!hasSAB) return;
+    this.size = size;
+    const slotSize = Math.max(size, 1024);
+    this.slotSize = slotSize;
+    this.sab = new SharedArrayBuffer(slotSize * c + 64);
+    this.worker = new Worker(workerUrl);
+    this.worker.postMessage({ cmd: 'init-sab', sab: this.sab, slotSize, count: c });
+    this.pending = new Map();
+    this.worker.onmessage = e => {
+      const cb = this.pending.get(e.data.id);
+      if (cb) { this.pending.delete(e.data.id); cb(); }
+    };
+  }
+  async teardown() { if (this.worker) this.worker.terminate(); }
+  roundTrip(slotIndex, size) {
+    return new Promise(resolve => {
+      const id = ++this._id || (this._id = 1);
+      this.pending.set(id, resolve);
+      const offset = slotIndex * this.slotSize;
+      const view = new Uint8Array(this.sab, offset, size);
+      fillRandom(view);
+      this.worker.postMessage({ type: 'sab-postmessage', id, offset, size });
+    });
+  }
+}
+
+class SABAtomics extends Approach {
+  async setup(c, size) {
+    if (!hasSABA) return;
+    this.size = size;
+    const slotSize = Math.max(size, 1024);
+    this.slotSize = slotSize;
+    this.count = c;
+    // meta: [status0, status1, ..., resp0, resp1, ...]
+    this.sab = new SharedArrayBuffer(slotSize * c + c * 2 * 4 + 64);
+    this.meta = new Int32Array(this.sab, slotSize * c, c * 2);
+    this.worker = new Worker(workerUrl);
+    this.worker.postMessage({ cmd: 'init-sab-atomics', sab: this.sab, meta: this.meta, slotSize, count: c });
+  }
+  async teardown() { if (this.worker) this.worker.terminate(); }
+  async roundTrip(slotIndex, size) {
+    const offset = slotIndex * this.slotSize;
+    const view = new Uint8Array(this.sab, offset, size);
+    fillRandom(view);
+
+    // reset response flag
+    Atomics.store(this.meta, slotIndex + this.count, 0);
+    // set request flag
+    Atomics.store(this.meta, slotIndex, 1);
+    Atomics.notify(this.meta, slotIndex, 1);
+
+    // wait for response
+    await Atomics.waitAsync(this.meta, slotIndex + this.count, 0).value;
+    Atomics.store(this.meta, slotIndex + this.count, 0);
+  }
+}
+
+// ===================== Benchmark Runner =====================
+const APPROACHES = [
+  { name: 'Structured Clone', cls: StructuredClone, supported: true },
+  { name: 'Transferable', cls: Transferable, supported: true },
+  { name: 'MessageChannel', cls: MessageChannelApproach, supported: true },
+  { name: 'BroadcastChannel', cls: BroadcastChannelApproach, supported: hasBC },
+  { name: 'SAB + postMessage', cls: SABPostMessage, supported: hasSAB },
+  { name: 'SAB + Atomics', cls: SABAtomics, supported: hasSABA },
+];
+
+async function runChaos(approachInfo, size, concurrency, durationMs) {
+  const inst = new approachInfo.cls(approachInfo.name);
+  await inst.setup(concurrency, size);
+
+  const start = performance.now();
+  let completed = 0;
+
+  const runners = [];
+  for (let i = 0; i < concurrency; i++) {
+    runners.push((async () => {
+      while (performance.now() - start < durationMs) {
+        await inst.roundTrip(i, size);
+        completed++;
+      }
+    })());
+  }
+
+  await Promise.all(runners);
+  const elapsed = performance.now() - start;
+  await inst.teardown();
+
+  return {
+    approach: approachInfo.name,
+    size: size <= 1024 ? '1 KB' : '1 MB',
+    concurrency,
+    completed,
+    rps: completed / (elapsed / 1000),
+    latency: elapsed / completed,
+  };
+}
+
+async function runSuite() {
+  const duration = parseInt(document.getElementById('duration').value, 10);
+  const payloadMode = document.getElementById('payload-mode').value;
+  const maxConc = parseInt(document.getElementById('max-concurrency').value, 10);
+  const concurrencies = [1, 10, 50, 100].filter(c => c <= maxConc);
+  const sizes = [];
+  if (payloadMode === 'both' || payloadMode === 'small') sizes.push(1024);
+  if (payloadMode === 'both' || payloadMode === 'large') sizes.push(1024 * 1024);
+
+  const totalTests = APPROACHES.filter(a => a.supported).length * sizes.length * concurrencies.length;
+  let done = 0;
+  const results = [];
+
+  for (const approach of APPROACHES) {
+    if (!approach.supported) continue;
+    for (const size of sizes) {
+      for (const c of concurrencies) {
+        setStatus(`Running: ${approach.name} — ${size <= 1024 ? '1 KB' : '1 MB'} — concurrency ${c}`);
+        try {
+          const res = await runChaos(approach, size, c, duration);
+          results.push(res);
+          log(`${res.approach.padEnd(20)} ${res.size} c=${String(c).padStart(3)} → ${Math.round(res.rps).toLocaleString()} rt/s  (${res.latency.toFixed(2)} ms/rt)`);
+        } catch (err) {
+          log(`ERROR: ${approach.name} ${size} c=${c} — ${err.message}`);
+          results.push({ approach: approach.name, size: size <= 1024 ? '1 KB' : '1 MB', concurrency: c, completed: 0, rps: 0, latency: Infinity, error: true });
+        }
+        done++;
+        setProgress((done / totalTests) * 100);
+      }
+    }
+  }
+
+  setStatus(`Complete — ${totalTests} tests finished.`);
+  setProgress(100);
+  return results;
+}
+
+// ===================== Rendering =====================
+function formatRps(v) {
+  if (v >= 1_000_000) return (v / 1_000_000).toFixed(1) + 'M';
+  if (v >= 1_000) return (v / 1_000).toFixed(1) + 'k';
+  return v.toFixed(0);
+}
+
+function heatClass(rps) {
+  if (rps === 0) return 'heat-na';
+  if (rps >= 10_000) return 'heat-fast';
+  if (rps >= 1_000) return 'heat-mid';
+  return 'heat-slow';
+}
+
+function renderResults(results) {
+  const sizes = [...new Set(results.map(r => r.size))];
+  const concurrencies = [...new Set(results.map(r => r.concurrency))].sort((a, b) => a - b);
+
+  let html = '';
+
+  for (const size of sizes) {
+    html += `<h3>${size} Payload — Round-trips/sec</h3>`;
+    html += '<table class="matrix-table"><thead><tr><th>Approach</th>';
+    for (const c of concurrencies) {
+      html += `<th>${c === 1 ? 'Sequential' : c + ' concurrent'}</th>`;
+    }
+    html += '</tr></thead><tbody>';
+
+    for (const approach of APPROACHES) {
+      if (!approach.supported) continue;
+      const rowResults = results.filter(r => r.approach === approach.name && r.size === size);
+      if (!rowResults.length) continue;
+
+      html += `<tr><td><span class="approach-name">${approach.name}</span></td>`;
+      for (const c of concurrencies) {
+        const r = rowResults.find(x => x.concurrency === c);
+        if (!r || r.error) {
+          html += '<td class="heat-na">N/A</td>';
+        } else {
+          const cls = heatClass(r.rps);
+          html += `<td class="${cls}"><span class="cell-value">${formatRps(r.rps)}</span><br><span class="cell-suffix">${r.latency.toFixed(2)} ms/rt</span></td>`;
+        }
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table>';
+  }
+
+  document.getElementById('results').innerHTML = html;
+}
+
+// ===================== Event Handlers =====================
+document.getElementById('run-btn').addEventListener('click', async () => {
+  document.getElementById('run-btn').disabled = true;
+  document.getElementById('log').textContent = '';
+  document.getElementById('results').innerHTML = '';
+  setProgress(0);
+
+  const results = await runSuite();
+  renderResults(results);
+
+  document.getElementById('run-btn').disabled = false;
+});
+
+document.getElementById('clear-btn').addEventListener('click', () => {
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('log').textContent = '';
+  setProgress(0);
+  setStatus('');
+});
+
+// Log feature support
+log('Feature detection:');
+log('  SharedArrayBuffer: ' + (hasSAB ? 'YES' : 'NO (needs COOP/COEP headers)'));
+log('  Atomics.waitAsync: ' + (hasSABA ? 'YES' : 'NO'));
+log('  BroadcastChannel: ' + (hasBC ? 'YES' : 'NO'));
+</script>
+</body>
+</html>
