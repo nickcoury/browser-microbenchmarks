@@ -105,7 +105,7 @@
         <li><strong>Round-trip</strong> = main sends data → worker modifies → worker replies → main receives.</li>
         <li><strong>Sequential</strong> (concurrency=1): one caller awaits each round-trip before starting the next.</li>
         <li><strong>Chaos</strong> (concurrency=N): N independent loops each fire round-trips as fast as possible for the duration.</li>
-        <li><strong>Pre-allocation:</strong> All payloads/buffers are created and filled once during <code>setup()</code>, then <strong>reused</strong> across round-trips. The measured cost is only message-passing + modification, not allocation + initialization.</li>
+        <li><strong>Pre-allocation:</strong> All payloads/buffers are created once during <code>setup()</code> as <strong>zero-initialized</strong> and reused across round-trips. No filling happens on the hot path. The measured cost is only message-passing + worker-side modification.</li>
         <li><strong>1 KB payload:</strong> object with a 1 KB Uint8Array; worker touches every byte.</li>
         <li><strong>1 MB payload:</strong> object with a 1 MB Uint8Array; worker touches header + 16 samples.</li>
         <li><strong>10 MB payload:</strong> object with a 10 MB Uint8Array; worker touches header + 16 samples. This is where transferable zero-copy should dominate structured clone.</li>
@@ -330,13 +330,12 @@ let counter = 0;
 function makeSmallPayload() {
   return { counter: ++counter, ts: performance.now(), buffer: new Uint8Array(1024 - 64) };
 }
-function makeLargePayload() {
-  return { counter: ++counter, ts: performance.now(), meta: { v: 1 }, buffer: new Uint8Array(1024 * 1024 - 64) };
+function makeLargePayload(size) {
+  return { counter: ++counter, ts: performance.now(), meta: { v: 1 }, buffer: new Uint8Array(size - 64) };
 }
-function makeSmallBuffer() { return new ArrayBuffer(1024); }
-function makeLargeBuffer() { return new ArrayBuffer(1024 * 1024); }
-function fillRandom(view) {
-  for (let i = 0; i < view.length; i++) view[i] = (i * 7 + 13) % 256;
+function makeBuffer(size) { return new ArrayBuffer(size); }
+function makePayload(size) {
+  return size <= 1024 ? makeSmallPayload() : makeLargePayload(size);
 }
 
 // ===================== Approach Base =====================
@@ -359,8 +358,7 @@ class StructuredClone extends Approach {
     // Pre-allocate payloads so round-trip only measures message-passing + modification
     this.buffers = [];
     for (let i = 0; i < c; i++) {
-      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
-      fillRandom(new Uint8Array(this.buffers[i].buffer));
+      this.buffers.push(makePayload(size));
     }
   }
   async teardown() { this.worker.terminate(); }
@@ -369,7 +367,6 @@ class StructuredClone extends Approach {
       const id = ++this._id || (this._id = 1);
       this.pending.set(id, resolve);
       const payload = this.buffers[slotIndex];
-      fillRandom(new Uint8Array(payload.buffer));
       payload.counter++;
       payload.ts = performance.now();
       this.worker.postMessage({ type: 'structured-clone', id, payload, size });
@@ -389,8 +386,7 @@ class Transferable extends Approach {
     // Pre-allocate buffers so round-trip only measures transfer + modification
     this.buffers = [];
     for (let i = 0; i < c; i++) {
-      this.buffers.push(size <= 1024 ? makeSmallBuffer() : makeLargeBuffer());
-      fillRandom(new Uint8Array(this.buffers[i]));
+      this.buffers.push(makeBuffer(size));
     }
   }
   async teardown() { this.worker.terminate(); }
@@ -398,7 +394,6 @@ class Transferable extends Approach {
     return new Promise(resolve => {
       const id = ++this._id || (this._id = 1);
       const buf = this.buffers[slotIndex];
-      fillRandom(new Uint8Array(buf));
       // Capture transferred buffer back into the pool on return
       this.pending.set(id, (returnedBuf) => {
         this.buffers[slotIndex] = returnedBuf;
@@ -427,8 +422,7 @@ class MessageChannelApproach extends Approach {
       };
       mc.port1.start();
       this.ports.push(mc.port1);
-      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
-      fillRandom(new Uint8Array(this.buffers[i].buffer));
+      this.buffers.push(makePayload(size));
     }
   }
   async teardown() { this.worker.terminate(); }
@@ -439,7 +433,6 @@ class MessageChannelApproach extends Approach {
       const id = ++this._id || (this._id = 1);
       pend.set(id, resolve);
       const payload = this.buffers[slotIndex % this.buffers.length];
-      fillRandom(new Uint8Array(payload.buffer));
       payload.counter++;
       payload.ts = performance.now();
       port.postMessage({ type: 'structured-clone', id, payload, size });
@@ -470,7 +463,6 @@ class SABPostMessage extends Approach {
       this.pending.set(id, resolve);
       const offset = slotIndex * this.slotSize;
       const view = new Uint8Array(this.sab, offset, size);
-      fillRandom(view);
       this.worker.postMessage({ type: 'sab-postmessage', id, offset, size });
     });
   }
@@ -493,7 +485,6 @@ class SABAtomics extends Approach {
   async roundTrip(slotIndex, size) {
     const offset = slotIndex * this.slotSize;
     const view = new Uint8Array(this.sab, offset, size);
-    fillRandom(view);
     Atomics.store(this.meta, slotIndex + this.count, 0);
     Atomics.store(this.meta, slotIndex, 1);
     Atomics.notify(this.meta, slotIndex, 1);
@@ -521,8 +512,7 @@ class ComlinkProxy extends Approach {
       };
       mc.port1.start();
       this.ports.push(mc.port1);
-      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
-      fillRandom(new Uint8Array(this.buffers[i].buffer));
+      this.buffers.push(makePayload(size));
     }
   }
   async teardown() { this.worker.terminate(); }
@@ -533,7 +523,6 @@ class ComlinkProxy extends Approach {
       const id = ++this._id || (this._id = 1);
       pend.set(id, resolve);
       const payload = this.buffers[slotIndex % this.buffers.length];
-      fillRandom(new Uint8Array(payload.buffer));
       payload.counter++;
       payload.ts = performance.now();
       // Comlink serializes as {id, method, args}
@@ -558,8 +547,7 @@ class DedicatedWorkerPool extends Approach {
         if (cb) { pend.delete(e.data.id); cb(e.data.payload); }
       };
       this.workers.push(worker);
-      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
-      fillRandom(new Uint8Array(this.buffers[i].buffer));
+      this.buffers.push(makePayload(size));
     }
   }
   async teardown() { for (const w of this.workers) w.terminate(); }
@@ -570,7 +558,6 @@ class DedicatedWorkerPool extends Approach {
       const id = ++this._id || (this._id = 1);
       pend.set(id, resolve);
       const payload = this.buffers[slotIndex % this.buffers.length];
-      fillRandom(new Uint8Array(payload.buffer));
       payload.counter++;
       payload.ts = performance.now();
       worker.postMessage({ type: 'structured-clone', id, payload, size });
@@ -600,8 +587,7 @@ class TransferableStreams extends Approach {
       this.writers.push(mainToWorker.writable.getWriter());
       this.readers.push(workerToMain.readable.getReader());
       this.pending.push(new Map());
-      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
-      fillRandom(new Uint8Array(this.buffers[i].buffer));
+      this.buffers.push(makePayload(size));
 
       // Transfer the opposite ends to the worker
       pairsToTransfer.push({
@@ -653,7 +639,6 @@ class TransferableStreams extends Approach {
     const idx = slotIndex % this.writers.length;
     const id = ++this._id || (this._id = 1);
     const payload = this.buffers[idx];
-    fillRandom(new Uint8Array(payload.buffer));
     payload.counter++;
     payload.ts = performance.now();
 
@@ -687,8 +672,7 @@ class IndexedDBApproach extends Approach {
     this._counter = 0;
     this.buffers = [];
     for (let i = 0; i < c; i++) {
-      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
-      fillRandom(new Uint8Array(this.buffers[i].buffer));
+      this.buffers.push(makePayload(size));
     }
   }
   async teardown() { this.db.close(); }
@@ -696,7 +680,6 @@ class IndexedDBApproach extends Approach {
     return new Promise((resolve, reject) => {
       const id = ++this._counter;
       const payload = this.buffers[slotIndex % this.buffers.length];
-      fillRandom(new Uint8Array(payload.buffer));
       payload.counter++;
       payload.ts = performance.now();
       const tx = this.db.transaction('bench', 'readwrite');
@@ -730,14 +713,12 @@ class WebLocks extends Approach {
     this.view = this.sab ? new Int32Array(this.sab) : null;
     this.buffers = [];
     for (let i = 0; i < c; i++) {
-      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
-      fillRandom(new Uint8Array(this.buffers[i].buffer));
+      this.buffers.push(makePayload(size));
     }
   }
   async teardown() { }
   roundTrip(slotIndex, size) {
     const payload = this.buffers[slotIndex % this.buffers.length];
-    fillRandom(new Uint8Array(payload.buffer));
     payload.counter++;
     payload.ts = performance.now();
     return new Promise(async (resolve) => {
