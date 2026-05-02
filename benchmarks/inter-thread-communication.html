@@ -108,7 +108,7 @@
         <li><strong>1 MB payload:</strong> object with a 1 MB Uint8Array; worker touches header + 16 samples.</li>
         <li><strong>Comlink Proxy:</strong> Simulated RPC via MessageChannel — method call serialized as {method,args,id}, response proxied back.</li>
         <li><strong>Dedicated Worker Pool:</strong> Spawns exactly <em>concurrency</em> workers, each serving exactly one caller.</li>
-        <li><strong>Transferable Streams:</strong> WritableStream → worker → TransformStream → ReadableStream back to main.</li>
+        <li><strong>Transferable Streams:</strong> One <code>TransformStream</code> pair per caller, all piped through a single worker. Tests per-pipe overhead and backpressure isolation.</li>
         <li><strong>IndexedDB:</strong> Worker writes payload to IDB, reads it back. Tests persistence layer round-trip cost.</li>
         <li><strong>Web Locks:</strong> Main acquires shared lock, worker acquires shared lock, both modify shared state, both release. Tests coordination overhead.</li>
         <li><strong>SAB</strong> requires cross-origin isolation headers — shown as N/A if unavailable.</li>
@@ -171,6 +171,13 @@ self.onmessage = function(e) {
   }
   if (d.cmd === 'init-stream') {
     startStreamWorker(d.writable, d.readableBack);
+    return;
+  }
+  if (d.cmd === 'init-streams') {
+    // Array of { readable, writable } pairs — one per caller
+    for (const pair of d.pairs) {
+      startStreamWorker(pair.readable, pair.writable);
+    }
     return;
   }
   if (d.cmd === 'init-comlink-port') {
@@ -499,55 +506,82 @@ class DedicatedWorkerPool extends Approach {
   }
 }
 
-// ===================== 8. Transferable Streams =====================
+// ===================== 8. Transferable Streams (dedicated pipe per caller) =====================
 class TransferableStreams extends Approach {
   async setup(c, size) {
     if (!hasStreams) return;
     this.size = size;
     this.worker = new Worker(workerUrl);
-    this.pending = new Map();
-
-    const mainToWorker = new TransformStream();
-    const workerToMain = new TransformStream();
-
-    this.writer = mainToWorker.writable.getWriter();
-    this.reader = workerToMain.readable.getReader();
-
-    this.worker.postMessage({
-      cmd: 'init-stream',
-      writable: mainToWorker.readable,
-      readableBack: workerToMain.writable
-    }, [mainToWorker.readable, workerToMain.writable]);
-
+    this.pending = [];      // pending maps per caller
+    this.writers = [];      // writers to worker (one per caller)
+    this.readers = [];      // readers from worker (one per caller)
     this._collecting = true;
-    this._collectLoop();
+
+    const pairsToTransfer = [];
+
+    for (let i = 0; i < c; i++) {
+      const mainToWorker = new TransformStream();
+      const workerToMain = new TransformStream();
+
+      // Main thread holds writer to worker, reader from worker
+      this.writers.push(mainToWorker.writable.getWriter());
+      this.readers.push(workerToMain.readable.getReader());
+      this.pending.push(new Map());
+
+      // Transfer the opposite ends to the worker
+      pairsToTransfer.push({
+        readable: mainToWorker.readable,
+        writable: workerToMain.writable
+      });
+    }
+
+    this.worker.postMessage({ cmd: 'init-streams', pairs: pairsToTransfer },
+      pairsToTransfer.flatMap(p => [p.readable, p.writable]));
+
+    // Start response collectors
+    for (let i = 0; i < c; i++) {
+      this._collectLoop(i);
+    }
   }
 
-  async _collectLoop() {
-    while (this._collecting) {
-      try {
-        const { done, value } = await this.reader.read();
+  async _collectLoop(idx) {
+    const reader = this.readers[idx];
+    const pending = this.pending[idx];
+    try {
+      while (this._collecting) {
+        const { done, value } = await reader.read();
         if (done) break;
-        const cb = this.pending.get(value.id);
-        if (cb) { this.pending.delete(value.id); cb(value.payload); }
-      } catch { break; }
+        const cb = pending.get(value.id);
+        if (cb) { pending.delete(value.id); cb(value.payload); }
+      }
+    } catch (e) {
+      // Stream errored or cancelled
     }
   }
 
   async teardown() {
     this._collecting = false;
-    try { await this.writer.close(); } catch {}
-    try { await this.reader.cancel(); } catch {}
+    for (const w of this.writers) {
+      try { await w.close(); } catch {}
+    }
+    for (const r of this.readers) {
+      try { await r.cancel(); } catch {}
+    }
     this.worker.terminate();
   }
 
-  roundTrip(slotIndex, size) {
-    return new Promise(resolve => {
-      const id = ++this._id || (this._id = 1);
-      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
-      fillRandom(new Uint8Array(payload.buffer));
-      this.pending.set(id, resolve);
-      this.writer.write({ id, payload, size });
+  async roundTrip(slotIndex, size) {
+    const idx = slotIndex % this.writers.length;
+    const id = ++this._id || (this._id = 1);
+    const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+    fillRandom(new Uint8Array(payload.buffer));
+
+    return new Promise((resolve, reject) => {
+      this.pending[idx].set(id, resolve);
+      this.writers[idx].write({ id, payload, size }).catch(err => {
+        this.pending[idx].delete(id);
+        reject(err);
+      });
     });
   }
 }
