@@ -104,6 +104,7 @@
         <li><strong>Round-trip</strong> = main sends data → worker modifies → worker replies → main receives.</li>
         <li><strong>Sequential</strong> (concurrency=1): one caller awaits each round-trip before starting the next.</li>
         <li><strong>Chaos</strong> (concurrency=N): N independent loops each fire round-trips as fast as possible for the duration.</li>
+        <li><strong>Pre-allocation:</strong> All payloads/buffers are created and filled once during <code>setup()</code>, then <strong>reused</strong> across round-trips. The measured cost is only message-passing + modification, not allocation + initialization.</li>
         <li><strong>1 KB payload:</strong> object with a 1 KB Uint8Array; worker touches every byte.</li>
         <li><strong>1 MB payload:</strong> object with a 1 MB Uint8Array; worker touches header + 16 samples.</li>
         <li><strong>Comlink Proxy:</strong> Simulated RPC via MessageChannel — method call serialized as {method,args,id}, response proxied back.</li>
@@ -353,14 +354,22 @@ class StructuredClone extends Approach {
       const cb = this.pending.get(e.data.id);
       if (cb) { this.pending.delete(e.data.id); cb(e.data.payload); }
     };
+    // Pre-allocate payloads so round-trip only measures message-passing + modification
+    this.buffers = [];
+    for (let i = 0; i < c; i++) {
+      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
+      fillRandom(new Uint8Array(this.buffers[i].buffer));
+    }
   }
   async teardown() { this.worker.terminate(); }
   roundTrip(slotIndex, size) {
     return new Promise(resolve => {
       const id = ++this._id || (this._id = 1);
       this.pending.set(id, resolve);
-      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+      const payload = this.buffers[slotIndex];
       fillRandom(new Uint8Array(payload.buffer));
+      payload.counter++;
+      payload.ts = performance.now();
       this.worker.postMessage({ type: 'structured-clone', id, payload, size });
     });
   }
@@ -375,15 +384,25 @@ class Transferable extends Approach {
       const cb = this.pending.get(e.data.id);
       if (cb) { this.pending.delete(e.data.id); cb(e.data.payload); }
     };
+    // Pre-allocate buffers so round-trip only measures transfer + modification
+    this.buffers = [];
+    for (let i = 0; i < c; i++) {
+      this.buffers.push(size <= 1024 ? makeSmallBuffer() : makeLargeBuffer());
+      fillRandom(new Uint8Array(this.buffers[i]));
+    }
   }
   async teardown() { this.worker.terminate(); }
   roundTrip(slotIndex, size) {
     return new Promise(resolve => {
       const id = ++this._id || (this._id = 1);
-      this.pending.set(id, resolve);
-      const payload = size <= 1024 ? makeSmallBuffer() : makeLargeBuffer();
-      fillRandom(new Uint8Array(payload));
-      this.worker.postMessage({ type: 'transferable', id, payload, size }, [payload]);
+      const buf = this.buffers[slotIndex];
+      fillRandom(new Uint8Array(buf));
+      // Capture transferred buffer back into the pool on return
+      this.pending.set(id, (returnedBuf) => {
+        this.buffers[slotIndex] = returnedBuf;
+        resolve(returnedBuf);
+      });
+      this.worker.postMessage({ type: 'transferable', id, payload: buf, size }, [buf]);
     });
   }
 }
@@ -394,6 +413,7 @@ class MessageChannelApproach extends Approach {
     this.worker = new Worker(workerUrl);
     this.ports = [];
     this.pending = [];
+    this.buffers = [];
     for (let i = 0; i < c; i++) {
       const mc = new MessageChannel();
       this.worker.postMessage({ cmd: 'init-port', port: mc.port2, portId: i }, [mc.port2]);
@@ -405,6 +425,8 @@ class MessageChannelApproach extends Approach {
       };
       mc.port1.start();
       this.ports.push(mc.port1);
+      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
+      fillRandom(new Uint8Array(this.buffers[i].buffer));
     }
   }
   async teardown() { this.worker.terminate(); }
@@ -414,8 +436,10 @@ class MessageChannelApproach extends Approach {
       const pend = this.pending[slotIndex % this.pending.length];
       const id = ++this._id || (this._id = 1);
       pend.set(id, resolve);
-      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+      const payload = this.buffers[slotIndex % this.buffers.length];
       fillRandom(new Uint8Array(payload.buffer));
+      payload.counter++;
+      payload.ts = performance.now();
       port.postMessage({ type: 'structured-clone', id, payload, size });
     });
   }
@@ -483,6 +507,7 @@ class ComlinkProxy extends Approach {
     this.worker = new Worker(workerUrl);
     this.ports = [];
     this.pending = [];
+    this.buffers = [];
     for (let i = 0; i < c; i++) {
       const mc = new MessageChannel();
       this.worker.postMessage({ cmd: 'init-comlink-port', port: mc.port2 }, [mc.port2]);
@@ -494,6 +519,8 @@ class ComlinkProxy extends Approach {
       };
       mc.port1.start();
       this.ports.push(mc.port1);
+      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
+      fillRandom(new Uint8Array(this.buffers[i].buffer));
     }
   }
   async teardown() { this.worker.terminate(); }
@@ -503,8 +530,10 @@ class ComlinkProxy extends Approach {
       const pend = this.pending[slotIndex % this.pending.length];
       const id = ++this._id || (this._id = 1);
       pend.set(id, resolve);
-      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+      const payload = this.buffers[slotIndex % this.buffers.length];
       fillRandom(new Uint8Array(payload.buffer));
+      payload.counter++;
+      payload.ts = performance.now();
       // Comlink serializes as {id, method, args}
       port.postMessage({ id, method: 'process', args: [payload, size] });
     });
@@ -517,6 +546,7 @@ class DedicatedWorkerPool extends Approach {
     this.size = size;
     this.workers = [];
     this.pending = [];
+    this.buffers = [];
     for (let i = 0; i < c; i++) {
       const worker = new Worker(workerUrl);
       const pend = new Map();
@@ -526,6 +556,8 @@ class DedicatedWorkerPool extends Approach {
         if (cb) { pend.delete(e.data.id); cb(e.data.payload); }
       };
       this.workers.push(worker);
+      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
+      fillRandom(new Uint8Array(this.buffers[i].buffer));
     }
   }
   async teardown() { for (const w of this.workers) w.terminate(); }
@@ -535,8 +567,10 @@ class DedicatedWorkerPool extends Approach {
       const pend = this.pending[slotIndex % this.pending.length];
       const id = ++this._id || (this._id = 1);
       pend.set(id, resolve);
-      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+      const payload = this.buffers[slotIndex % this.buffers.length];
       fillRandom(new Uint8Array(payload.buffer));
+      payload.counter++;
+      payload.ts = performance.now();
       worker.postMessage({ type: 'structured-clone', id, payload, size });
     });
   }
@@ -552,6 +586,7 @@ class TransferableStreams extends Approach {
     this.writers = [];      // writers to worker (one per caller)
     this.readers = [];      // readers from worker (one per caller)
     this._collecting = true;
+    this.buffers = [];
 
     const pairsToTransfer = [];
 
@@ -563,6 +598,8 @@ class TransferableStreams extends Approach {
       this.writers.push(mainToWorker.writable.getWriter());
       this.readers.push(workerToMain.readable.getReader());
       this.pending.push(new Map());
+      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
+      fillRandom(new Uint8Array(this.buffers[i].buffer));
 
       // Transfer the opposite ends to the worker
       pairsToTransfer.push({
@@ -613,8 +650,10 @@ class TransferableStreams extends Approach {
     }
     const idx = slotIndex % this.writers.length;
     const id = ++this._id || (this._id = 1);
-    const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+    const payload = this.buffers[idx];
     fillRandom(new Uint8Array(payload.buffer));
+    payload.counter++;
+    payload.ts = performance.now();
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -644,13 +683,20 @@ class IndexedDBApproach extends Approach {
     this.db = await openDB();
     this.pending = new Map();
     this._counter = 0;
+    this.buffers = [];
+    for (let i = 0; i < c; i++) {
+      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
+      fillRandom(new Uint8Array(this.buffers[i].buffer));
+    }
   }
   async teardown() { this.db.close(); }
   roundTrip(slotIndex, size) {
     return new Promise((resolve, reject) => {
       const id = ++this._counter;
-      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+      const payload = this.buffers[slotIndex % this.buffers.length];
       fillRandom(new Uint8Array(payload.buffer));
+      payload.counter++;
+      payload.ts = performance.now();
       const tx = this.db.transaction('bench', 'readwrite');
       const store = tx.objectStore('bench');
       const req = store.put(payload, id);
@@ -680,11 +726,18 @@ class WebLocks extends Approach {
     this.lockName = 'bmc-lock-' + Math.random().toString(36).slice(2);
     this.sab = hasSAB ? new SharedArrayBuffer(4) : null;
     this.view = this.sab ? new Int32Array(this.sab) : null;
+    this.buffers = [];
+    for (let i = 0; i < c; i++) {
+      this.buffers.push(size <= 1024 ? makeSmallPayload() : makeLargePayload());
+      fillRandom(new Uint8Array(this.buffers[i].buffer));
+    }
   }
   async teardown() { }
   roundTrip(slotIndex, size) {
-    const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+    const payload = this.buffers[slotIndex % this.buffers.length];
     fillRandom(new Uint8Array(payload.buffer));
+    payload.counter++;
+    payload.ts = performance.now();
     return new Promise(async (resolve) => {
       await navigator.locks.request(this.lockName, async () => {
         // Modify shared memory if available (simulates shared state)
