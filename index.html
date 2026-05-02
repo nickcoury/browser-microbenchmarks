@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Browser Microbenchmarks</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>🔬 Browser Microbenchmarks</h1>
+      <p>Client-side performance tests for the modern web.</p>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="intro">
+      <p>
+        This is a collection of focused browser microbenchmarks. Each test isolates a specific
+        API, pattern, or engine behavior. Results are measured in your browser — no server round-trips,
+        no network variance.
+      </p>
+    </section>
+
+    <section class="benchmarks-list">
+      <h2>Benchmarks</h2>
+      <div class="benchmarks-grid" id="benchmarks-grid">
+        <!-- Benchmarks will be listed here -->
+        <a href="benchmarks/dom-manipulation.html" class="benchmark-card">
+          <h3>DOM Manipulation</h3>
+          <p>innerHTML vs createElement vs DocumentFragment vs insertAdjacentHTML</p>
+          <span class="status ready">ready</span>
+        </a>
+
+        <a href="benchmarks/template.html" class="benchmark-card template">
+          <h3>+ New Benchmark</h3>
+          <p>Copy this template to add a new microbenchmark.</p>
+          <span class="status template">template</span>
+        </a>
+      </div>
+    </section>
+
+    <section class="methodology">
+      <h2>Methodology</h2>
+      <ul>
+        <li>Each benchmark runs a <strong>warmup</strong> round to JIT-stabilize.</li>
+        <li>Measurements use <code>performance.now()</code> with sub-millisecond precision.</li>
+        <li>Outliers beyond 2&sigma; are discarded automatically.</li>
+        <li>Results show <strong>ops/sec</strong> (higher is better) and <strong>relative</strong> comparison to the fastest variant.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container">
+      <p>
+        <a href="https://github.com/nickcoury/browser-microbenchmarks">Source on GitHub</a>
+        &middot;
+        <a href="https://nickcoury.github.io/browser-microbenchmarks/">GitHub Pages</a>
+      </p>
+    </div>
+  </footer>
+</body>
+</html>

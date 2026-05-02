@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Benchmark Template — Browser Microbenchmarks</title>
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="benchmark-page">
+  <header>
+    <div class="container">
+      <h1>🔬 Browser Microbenchmarks</h1>
+    </div>
+  </header>
+
+  <main class="container">
+    <a href="../index.html" class="back-link">← Back to all benchmarks</a>
+    <h2>Benchmark Title</h2>
+
+    <section class="description">
+      <p>
+        Describe what this benchmark measures and why it matters.
+        Keep it concise but informative.
+      </p>
+    </section>
+
+    <section class="config-panel">
+      <div class="config-row">
+        <label for="iterations">Iterations</label>
+        <input type="number" id="iterations" value="1000" min="1" max="1000000">
+      </div>
+    </section>
+
+    <div class="controls">
+      <button id="run-btn" class="btn">Run Benchmark</button>
+      <button id="clear-btn" class="btn btn-secondary">Clear Results</button>
+    </div>
+
+    <div id="table"></div>
+    <div class="chart-container">
+      <canvas id="chart" style="width:100%;height:220px;"></canvas>
+    </div>
+
+    <pre id="log" class="log"></pre>
+  </main>
+
+  <footer>
+    <div class="container">
+      <p>
+        <a href="https://github.com/nickcoury/browser-microbenchmarks">Source on GitHub</a>
+      </p>
+    </div>
+  </footer>
+
+  <script src="../js/benchmark.js"></script>
+  <script>
+    const iterations = () => parseInt(document.getElementById('iterations').value, 10);
+    const runner = new BenchmarkRunner({ logEl: document.getElementById('log') });
+
+    // TODO: Add your benchmark variants here
+    runner.add('Variant A', () => {
+      for (let i = 0; i < iterations(); i++) {
+        // Code under test
+      }
+    });
+
+    runner.add('Variant B', () => {
+      for (let i = 0; i < iterations(); i++) {
+        // Alternative implementation
+      }
+    });
+
+    document.getElementById('run-btn').addEventListener('click', async () => {
+      document.getElementById('run-btn').disabled = true;
+      document.getElementById('log').textContent = '';
+      const results = await runner.run();
+      renderResults(results, document.getElementById('table'), document.getElementById('chart'));
+      document.getElementById('run-btn').disabled = false;
+    });
+
+    document.getElementById('clear-btn').addEventListener('click', () => {
+      document.getElementById('table').innerHTML = '';
+      document.getElementById('log').textContent = '';
+      const c = document.getElementById('chart');
+      c.getContext('2d').clearRect(0, 0, c.width, c.height);
+    });
+  </script>
+</body>
+</html>

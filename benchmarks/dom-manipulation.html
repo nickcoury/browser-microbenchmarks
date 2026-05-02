@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DOM Manipulation — Browser Microbenchmarks</title>
+  <link rel="stylesheet" href="../css/style.css">
+</head>
+<body class="benchmark-page">
+  <header>
+    <div class="container">
+      <h1>🔬 Browser Microbenchmarks</h1>
+    </div>
+  </header>
+
+  <main class="container">
+    <a href="../index.html" class="back-link">← Back to all benchmarks</a>
+    <h2>DOM Manipulation</h2>
+
+    <section class="description">
+      <p>
+        Compares four common ways to insert multiple elements into the DOM:
+        <strong>innerHTML</strong> (string concat), <strong>createElement</strong> (imperative API),
+        <strong>DocumentFragment</strong> (batch insert), and <strong>insertAdjacentHTML</strong> (string append).
+        Each variant inserts 100 <code>&lt;div&gt;</code> nodes into a detached container so layout cost is isolated.
+      </p>
+    </section>
+
+    <section class="config-panel">
+      <div class="config-row">
+        <label for="node-count">Nodes per run</label>
+        <input type="number" id="node-count" value="100" min="1" max="10000">
+      </div>
+    </section>
+
+    <div class="controls">
+      <button id="run-btn" class="btn">Run Benchmark</button>
+      <button id="clear-btn" class="btn btn-secondary">Clear Results</button>
+    </div>
+
+    <div id="table"></div>
+    <div class="chart-container">
+      <canvas id="chart" style="width:100%;height:220px;"></canvas>
+    </div>
+
+    <pre id="log" class="log"></pre>
+  </main>
+
+  <footer>
+    <div class="container">
+      <p>
+        <a href="https://github.com/nickcoury/browser-microbenchmarks">Source on GitHub</a>
+      </p>
+    </div>
+  </footer>
+
+  <script src="../js/benchmark.js"></script>
+  <script>
+    const nodeCount = () => parseInt(document.getElementById('node-count').value, 10);
+    const runner = new BenchmarkRunner({ logEl: document.getElementById('log') });
+
+    let container;
+
+    runner.add('innerHTML', () => {
+      let html = '';
+      for (let i = 0; i < nodeCount(); i++) {
+        html += '<div class="item" data-i="' + i + '">Item ' + i + '</div>';
+      }
+      container.innerHTML = html;
+    }, {
+      setup: () => { container = document.createElement('div'); },
+      teardown: () => { container = null; }
+    });
+
+    runner.add('createElement', () => {
+      for (let i = 0; i < nodeCount(); i++) {
+        const el = document.createElement('div');
+        el.className = 'item';
+        el.dataset.i = String(i);
+        el.textContent = 'Item ' + i;
+        container.appendChild(el);
+      }
+    }, {
+      setup: () => { container = document.createElement('div'); },
+      teardown: () => { container = null; }
+    });
+
+    runner.add('DocumentFragment', () => {
+      const frag = document.createDocumentFragment();
+      for (let i = 0; i < nodeCount(); i++) {
+        const el = document.createElement('div');
+        el.className = 'item';
+        el.dataset.i = String(i);
+        el.textContent = 'Item ' + i;
+        frag.appendChild(el);
+      }
+      container.appendChild(frag);
+    }, {
+      setup: () => { container = document.createElement('div'); },
+      teardown: () => { container = null; }
+    });
+
+    runner.add('insertAdjacentHTML', () => {
+      let html = '';
+      for (let i = 0; i < nodeCount(); i++) {
+        html += '<div class="item" data-i="' + i + '">Item ' + i + '</div>';
+      }
+      container.insertAdjacentHTML('beforeend', html);
+    }, {
+      setup: () => { container = document.createElement('div'); },
+      teardown: () => { container = null; }
+    });
+
+    document.getElementById('run-btn').addEventListener('click', async () => {
+      document.getElementById('run-btn').disabled = true;
+      document.getElementById('log').textContent = '';
+      const results = await runner.run();
+      renderResults(results, document.getElementById('table'), document.getElementById('chart'));
+      document.getElementById('run-btn').disabled = false;
+    });
+
+    document.getElementById('clear-btn').addEventListener('click', () => {
+      document.getElementById('table').innerHTML = '';
+      document.getElementById('log').textContent = '';
+      const c = document.getElementById('chart');
+      c.getContext('2d').clearRect(0, 0, c.width, c.height);
+    });
+  </script>
+</body>
+</html>
