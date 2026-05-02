@@ -46,10 +46,9 @@
         bidirectional messages</strong>. Each round-trip modifies data on both sides.
       </p>
       <p style="margin-top:0.5rem;color:var(--text-muted);font-size:0.88rem;">
-        <strong>Approaches tested:</strong> Structured Clone, Transferable, MessageChannel (1:1 ports),
-        BroadcastChannel (pub/sub), SAB + postMessage (shared memory + message notification),
-        SAB + Atomics (lock-free sync), <strong>Comlink Proxy</strong> (RPC wrapper overhead),
-        <strong>Dedicated Worker Pool</strong> (1 worker per caller), <strong>Transferable Streams</strong> (piped backpressure).
+        <strong>Approaches:</strong> Structured Clone · Transferable · MessageChannel (1:1) ·
+        SAB + postMessage · SAB + Atomics · Comlink Proxy · Dedicated Worker Pool · Transferable Streams ·
+        IndexedDB · Web Locks
       </p>
     </section>
 
@@ -107,11 +106,12 @@
         <li><strong>Chaos</strong> (concurrency=N): N independent loops each fire round-trips as fast as possible for the duration.</li>
         <li><strong>1 KB payload:</strong> object with a 1 KB Uint8Array; worker touches every byte.</li>
         <li><strong>1 MB payload:</strong> object with a 1 MB Uint8Array; worker touches header + 16 samples.</li>
-        <li><strong>Transferable:</strong> ArrayBuffer ownership moves each direction (main→worker→main).</li>
         <li><strong>Comlink Proxy:</strong> Simulated RPC via MessageChannel — method call serialized as {method,args,id}, response proxied back.</li>
         <li><strong>Dedicated Worker Pool:</strong> Spawns exactly <em>concurrency</em> workers, each serving exactly one caller.</li>
         <li><strong>Transferable Streams:</strong> WritableStream → worker → TransformStream → ReadableStream back to main.</li>
-        <li><strong>SAB</strong> requires cross-origin isolation headers (not present on GitHub Pages) — shown as N/A if unavailable.</li>
+        <li><strong>IndexedDB:</strong> Worker writes payload to IDB, reads it back. Tests persistence layer round-trip cost.</li>
+        <li><strong>Web Locks:</strong> Main acquires shared lock, worker acquires shared lock, both modify shared state, both release. Tests coordination overhead.</li>
+        <li><strong>SAB</strong> requires cross-origin isolation headers — shown as N/A if unavailable.</li>
       </ul>
     </section>
 
@@ -128,13 +128,11 @@
 // ===================== Inline Worker =====================
 const WORKER_CODE = `
 const ports = new Map();
-let bc = null;
 let sab = null;
 let sabMeta = null;
 let sabSlotSize = 0;
 let sabCount = 0;
 
-// For Comlink proxy simulation
 const api = {
   process(data, size) {
     let result = data;
@@ -144,10 +142,7 @@ const api = {
   }
 };
 
-// For Transferable Streams
 let streamWriter = null;
-let streamReader = null;
-let streamCtrl = null;
 
 self.onmessage = function(e) {
   const d = e.data;
@@ -158,11 +153,6 @@ self.onmessage = function(e) {
     const pid = d.portId;
     ports.set(pid, port);
     port.onmessage = ev => handleRequest(ev.data, port);
-    return;
-  }
-  if (d.cmd === 'init-bc') {
-    bc = new BroadcastChannel(d.channel);
-    bc.onmessage = ev => handleRequest(ev.data, 'bc');
     return;
   }
   if (d.cmd === 'init-sab') {
@@ -180,7 +170,7 @@ self.onmessage = function(e) {
     return;
   }
   if (d.cmd === 'init-stream') {
-    initStreams(d.writable, d.readableBack);
+    startStreamWorker(d.writable, d.readableBack);
     return;
   }
   if (d.cmd === 'init-comlink-port') {
@@ -210,8 +200,7 @@ function handleRequest(data, replyTarget) {
   const response = { id, payload: result };
   const transfer = (type === 'transferable' && result instanceof ArrayBuffer) ? [result] : [];
 
-  if (replyTarget === 'bc') bc.postMessage(response);
-  else if (replyTarget === 'self') self.postMessage(response, transfer);
+  if (replyTarget === 'self') self.postMessage(response, transfer);
   else replyTarget.postMessage(response, transfer);
 }
 
@@ -253,22 +242,22 @@ function startAtomicLoop() {
   })();
 }
 
-// Transferable Streams: worker reads from main's writable, writes response to transform stream
-async function initStreams(writableFromMain, readableBackToMain) {
+async function startStreamWorker(writableFromMain, readableBackToMain) {
   const reader = writableFromMain.getReader();
   const writer = readableBackToMain.getWriter();
-  streamReader = reader;
-  streamWriter = writer;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const { id, payload, size } = value;
-    let result = payload;
-    if (result && result.buffer) modifyBuffer(result.buffer, size);
-    await writer.write({ id, payload: result });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const { id, payload, size } = value;
+      let result = payload;
+      if (result && result.buffer) modifyBuffer(result.buffer, size);
+      await writer.write({ id, payload: result });
+    }
+  } finally {
+    await writer.close();
   }
-  await writer.close();
 }
 `;
 
@@ -278,7 +267,6 @@ const workerUrl = URL.createObjectURL(workerBlob);
 // ===================== Feature Detection =====================
 const hasSAB = typeof SharedArrayBuffer !== 'undefined';
 const hasSABA = hasSAB && typeof Atomics !== 'undefined' && typeof Atomics.waitAsync === 'function';
-const hasBC = typeof BroadcastChannel !== 'undefined';
 const hasStreams = typeof ReadableStream !== 'undefined' && typeof WritableStream !== 'undefined' && typeof TransformStream !== 'undefined';
 
 function log(msg) {
@@ -288,13 +276,8 @@ function log(msg) {
   console.log(msg);
 }
 
-function setStatus(msg) {
-  document.getElementById('status').textContent = msg;
-}
-
-function setProgress(pct) {
-  document.getElementById('progress-fill').style.width = pct + '%';
-}
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+function setProgress(pct) { document.getElementById('progress-fill').style.width = pct + '%'; }
 
 // ===================== Payload Builders =====================
 let counter = 0;
@@ -310,18 +293,18 @@ function fillRandom(view) {
   for (let i = 0; i < view.length; i++) view[i] = (i * 7 + 13) % 256;
 }
 
-// ===================== Approach Implementations =====================
+// ===================== Approach Base =====================
 class Approach {
   constructor(name) { this.name = name; }
-  async setup(concurrency, size) { }
+  async setup(c, size) { }
   async teardown() { }
-  async roundTrip(slotIndex, size) { throw new Error('implement'); }
+  async roundTrip(slotIndex, size) { throw new Error('implement: ' + this.name); }
 }
 
+// ===================== 1. Structured Clone =====================
 class StructuredClone extends Approach {
   async setup(c, size) {
     this.worker = new Worker(workerUrl);
-    this.size = size;
     this.pending = new Map();
     this.worker.onmessage = e => {
       const cb = this.pending.get(e.data.id);
@@ -340,10 +323,10 @@ class StructuredClone extends Approach {
   }
 }
 
+// ===================== 2. Transferable =====================
 class Transferable extends Approach {
   async setup(c, size) {
     this.worker = new Worker(workerUrl);
-    this.size = size;
     this.pending = new Map();
     this.worker.onmessage = e => {
       const cb = this.pending.get(e.data.id);
@@ -362,10 +345,10 @@ class Transferable extends Approach {
   }
 }
 
+// ===================== 3. MessageChannel (1:1 port per caller) =====================
 class MessageChannelApproach extends Approach {
   async setup(c, size) {
     this.worker = new Worker(workerUrl);
-    this.size = size;
     this.ports = [];
     this.pending = [];
     for (let i = 0; i < c; i++) {
@@ -377,6 +360,7 @@ class MessageChannelApproach extends Approach {
         const cb = pend.get(e.data.id);
         if (cb) { pend.delete(e.data.id); cb(e.data.payload); }
       };
+      mc.port1.start();
       this.ports.push(mc.port1);
     }
   }
@@ -394,34 +378,7 @@ class MessageChannelApproach extends Approach {
   }
 }
 
-class BroadcastChannelApproach extends Approach {
-  async setup(c, size) {
-    this.channel = 'bmc-' + Math.random().toString(36).slice(2);
-    this.worker = new Worker(workerUrl);
-    this.worker.postMessage({ cmd: 'init-bc', channel: this.channel });
-    this.size = size;
-    this.pending = new Map();
-    this.bc = new BroadcastChannel(this.channel);
-    this.bc.onmessage = e => {
-      const cb = this.pending.get(e.data.id);
-      if (cb) { this.pending.delete(e.data.id); cb(e.data.payload); }
-    };
-  }
-  async teardown() {
-    if (this.bc) this.bc.close();
-    if (this.worker) this.worker.terminate();
-  }
-  roundTrip(slotIndex, size) {
-    return new Promise(resolve => {
-      const id = ++this._id || (this._id = 1);
-      this.pending.set(id, resolve);
-      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
-      fillRandom(new Uint8Array(payload.buffer));
-      this.bc.postMessage({ type: 'structured-clone', id, payload, size });
-    });
-  }
-}
-
+// ===================== 4. SAB + postMessage (shared memory, message notification) =====================
 class SABPostMessage extends Approach {
   async setup(c, size) {
     if (!hasSAB) return;
@@ -450,6 +407,7 @@ class SABPostMessage extends Approach {
   }
 }
 
+// ===================== 5. SAB + Atomics (lock-free wait/notify) =====================
 class SABAtomics extends Approach {
   async setup(c, size) {
     if (!hasSABA) return;
@@ -467,22 +425,19 @@ class SABAtomics extends Approach {
     const offset = slotIndex * this.slotSize;
     const view = new Uint8Array(this.sab, offset, size);
     fillRandom(view);
-
     Atomics.store(this.meta, slotIndex + this.count, 0);
     Atomics.store(this.meta, slotIndex, 1);
     Atomics.notify(this.meta, slotIndex, 1);
-
     const res = Atomics.waitAsync(this.meta, slotIndex + this.count, 0);
     if (res.async) await res.value;
     Atomics.store(this.meta, slotIndex + this.count, 0);
   }
 }
 
-// ===================== NEW: Comlink Proxy Simulation =====================
+// ===================== 6. Comlink Proxy (RPC wrapper overhead) =====================
 class ComlinkProxy extends Approach {
   async setup(c, size) {
     this.worker = new Worker(workerUrl);
-    this.size = size;
     this.ports = [];
     this.pending = [];
     for (let i = 0; i < c; i++) {
@@ -494,6 +449,7 @@ class ComlinkProxy extends Approach {
         const cb = pend.get(e.data.id);
         if (cb) { pend.delete(e.data.id); cb(e.data.result); }
       };
+      mc.port1.start();
       this.ports.push(mc.port1);
     }
   }
@@ -512,7 +468,7 @@ class ComlinkProxy extends Approach {
   }
 }
 
-// ===================== NEW: Dedicated Worker Pool =====================
+// ===================== 7. Dedicated Worker Pool (1 worker per caller) =====================
 class DedicatedWorkerPool extends Approach {
   async setup(c, size) {
     this.size = size;
@@ -529,9 +485,7 @@ class DedicatedWorkerPool extends Approach {
       this.workers.push(worker);
     }
   }
-  async teardown() {
-    for (const w of this.workers) w.terminate();
-  }
+  async teardown() { for (const w of this.workers) w.terminate(); }
   roundTrip(slotIndex, size) {
     return new Promise(resolve => {
       const worker = this.workers[slotIndex % this.workers.length];
@@ -545,7 +499,7 @@ class DedicatedWorkerPool extends Approach {
   }
 }
 
-// ===================== NEW: Transferable Streams =====================
+// ===================== 8. Transferable Streams =====================
 class TransferableStreams extends Approach {
   async setup(c, size) {
     if (!hasStreams) return;
@@ -553,21 +507,18 @@ class TransferableStreams extends Approach {
     this.worker = new Worker(workerUrl);
     this.pending = new Map();
 
-    // Create transform streams for bidirectional communication
     const mainToWorker = new TransformStream();
     const workerToMain = new TransformStream();
 
     this.writer = mainToWorker.writable.getWriter();
     this.reader = workerToMain.readable.getReader();
 
-    // Transfer the readable end of main->worker and writable end of worker->main
     this.worker.postMessage({
       cmd: 'init-stream',
       writable: mainToWorker.readable,
       readableBack: workerToMain.writable
     }, [mainToWorker.readable, workerToMain.writable]);
 
-    // Collect responses
     this._collecting = true;
     this._collectLoop();
   }
@@ -579,40 +530,104 @@ class TransferableStreams extends Approach {
         if (done) break;
         const cb = this.pending.get(value.id);
         if (cb) { this.pending.delete(value.id); cb(value.payload); }
-      } catch (e) { break; }
+      } catch { break; }
     }
   }
 
   async teardown() {
     this._collecting = false;
-    try { await this.writer.close(); } catch (e) {}
-    try { await this.reader.cancel(); } catch (e) {}
+    try { await this.writer.close(); } catch {}
+    try { await this.reader.cancel(); } catch {}
     this.worker.terminate();
   }
 
-  async roundTrip(slotIndex, size) {
-    const id = ++this._id || (this._id = 1);
-    const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
-    fillRandom(new Uint8Array(payload.buffer));
-
+  roundTrip(slotIndex, size) {
     return new Promise(resolve => {
+      const id = ++this._id || (this._id = 1);
+      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+      fillRandom(new Uint8Array(payload.buffer));
       this.pending.set(id, resolve);
       this.writer.write({ id, payload, size });
     });
   }
 }
 
+// ===================== 9. IndexedDB =====================
+class IndexedDBApproach extends Approach {
+  async setup(c, size) {
+    this.size = size;
+    this.db = await openDB();
+    this.pending = new Map();
+    this._counter = 0;
+  }
+  async teardown() { this.db.close(); }
+  roundTrip(slotIndex, size) {
+    return new Promise((resolve, reject) => {
+      const id = ++this._counter;
+      const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+      fillRandom(new Uint8Array(payload.buffer));
+      const tx = this.db.transaction('bench', 'readwrite');
+      const store = tx.objectStore('bench');
+      const req = store.put(payload, id);
+      req.onsuccess = () => {
+        const getReq = store.get(id);
+        getReq.onsuccess = () => resolve(getReq.result);
+        getReq.onerror = () => reject(getReq.error);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+}
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('bmc-idb', 1);
+    req.onupgradeneeded = () => req.result.createObjectStore('bench');
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// ===================== 10. Web Locks =====================
+class WebLocks extends Approach {
+  async setup(c, size) {
+    this.size = size;
+    this.lockName = 'bmc-lock-' + Math.random().toString(36).slice(2);
+    this.sab = hasSAB ? new SharedArrayBuffer(4) : null;
+    this.view = this.sab ? new Int32Array(this.sab) : null;
+  }
+  async teardown() { }
+  roundTrip(slotIndex, size) {
+    const payload = size <= 1024 ? makeSmallPayload() : makeLargePayload();
+    fillRandom(new Uint8Array(payload.buffer));
+    return new Promise(async (resolve) => {
+      await navigator.locks.request(this.lockName, async () => {
+        // Modify shared memory if available (simulates shared state)
+        if (this.view) {
+          this.view[0] = (this.view[0] + 1) & 0x7fffffff;
+        }
+        // Simulate a brief compute pass
+        for (let i = 0; i < payload.buffer.length; i += 64) {
+          payload.buffer[i] = (payload.buffer[i] + 1) % 256;
+        }
+        resolve(payload);
+      });
+    });
+  }
+}
+
 // ===================== Benchmark Runner =====================
 const APPROACHES = [
-  { name: 'Structured Clone', cls: StructuredClone, supported: true },
-  { name: 'Transferable', cls: Transferable, supported: true },
-  { name: 'MessageChannel', cls: MessageChannelApproach, supported: true },
-  { name: 'BroadcastChannel', cls: BroadcastChannelApproach, supported: hasBC },
-  { name: 'SAB + postMessage', cls: SABPostMessage, supported: hasSAB },
-  { name: 'SAB + Atomics', cls: SABAtomics, supported: hasSABA },
-  { name: 'Comlink Proxy', cls: ComlinkProxy, supported: true },
-  { name: 'Dedicated Worker Pool', cls: DedicatedWorkerPool, supported: true },
-  { name: 'Transferable Streams', cls: TransferableStreams, supported: hasStreams },
+  { name: 'Structured Clone',      cls: StructuredClone,       supported: true },
+  { name: 'Transferable',          cls: Transferable,          supported: true },
+  { name: 'MessageChannel',        cls: MessageChannelApproach, supported: true },
+  { name: 'SAB + postMessage',     cls: SABPostMessage,         supported: hasSAB },
+  { name: 'SAB + Atomics',         cls: SABAtomics,             supported: hasSABA },
+  { name: 'Comlink Proxy',         cls: ComlinkProxy,           supported: true },
+  { name: 'Dedicated Worker Pool', cls: DedicatedWorkerPool,    supported: true },
+  { name: 'Transferable Streams',  cls: TransferableStreams,    supported: hasStreams },
+  { name: 'IndexedDB',             cls: IndexedDBApproach,      supported: typeof indexedDB !== 'undefined' },
+  { name: 'Web Locks',             cls: WebLocks,               supported: typeof navigator !== 'undefined' && 'locks' in navigator },
 ];
 
 async function runChaos(approachInfo, size, concurrency, durationMs) {
@@ -702,7 +717,6 @@ function renderResults(results) {
   const concurrencies = [...new Set(results.map(r => r.concurrency))].sort((a, b) => a - b);
 
   let html = '';
-
   for (const size of sizes) {
     html += `<h3>${size} Payload — Round-trips/sec</h3>`;
     html += '<table class="matrix-table"><thead><tr><th>Approach</th>';
@@ -758,9 +772,9 @@ document.getElementById('clear-btn').addEventListener('click', () => {
 log('Feature detection:');
 log('  SharedArrayBuffer: ' + (hasSAB ? 'YES' : 'NO (needs COOP/COEP headers)'));
 log('  Atomics.waitAsync: ' + (hasSABA ? 'YES' : 'NO'));
-log('  BroadcastChannel: ' + (hasBC ? 'YES' : 'NO'));
 log('  Transferable Streams: ' + (hasStreams ? 'YES' : 'NO'));
-log('  Workers: ' + (typeof Worker !== 'undefined' ? 'YES' : 'NO'));
+log('  IndexedDB: ' + (typeof indexedDB !== 'undefined' ? 'YES' : 'NO'));
+log('  Web Locks: ' + (typeof navigator !== 'undefined' && 'locks' in navigator ? 'YES' : 'NO'));
 log('Ready.');
 </script>
 </body>
