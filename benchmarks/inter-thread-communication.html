@@ -66,9 +66,10 @@
         <div class="control">
           <label>Payload</label>
           <select id="payload-mode">
-            <option value="both" selected>Both sizes</option>
+            <option value="both">Both sizes</option>
             <option value="small">1 KB only</option>
-            <option value="large">1 MB only</option>
+            <option value="medium" selected>1 MB only</option>
+            <option value="large">10 MB only</option>
           </select>
         </div>
         <div class="control">
@@ -107,6 +108,7 @@
         <li><strong>Pre-allocation:</strong> All payloads/buffers are created and filled once during <code>setup()</code>, then <strong>reused</strong> across round-trips. The measured cost is only message-passing + modification, not allocation + initialization.</li>
         <li><strong>1 KB payload:</strong> object with a 1 KB Uint8Array; worker touches every byte.</li>
         <li><strong>1 MB payload:</strong> object with a 1 MB Uint8Array; worker touches header + 16 samples.</li>
+        <li><strong>10 MB payload:</strong> object with a 10 MB Uint8Array; worker touches header + 16 samples. This is where transferable zero-copy should dominate structured clone.</li>
         <li><strong>Comlink Proxy:</strong> Simulated RPC via MessageChannel — method call serialized as {method,args,id}, response proxied back.</li>
         <li><strong>Dedicated Worker Pool:</strong> Spawns exactly <em>concurrency</em> workers, each serving exactly one caller.</li>
         <li><strong>Transferable Streams:</strong> One <code>TransformStream</code> pair per caller, all piped through a single worker. Tests per-pipe overhead and backpressure isolation.</li>
@@ -806,7 +808,8 @@ async function runSuite() {
   const concurrencies = [1, 10, 50, 100, 200].filter(c => c <= maxConc);
   const sizes = [];
   if (payloadMode === 'both' || payloadMode === 'small') sizes.push(1024);
-  if (payloadMode === 'both' || payloadMode === 'large') sizes.push(1024 * 1024);
+  if (payloadMode === 'both' || payloadMode === 'medium') sizes.push(1024 * 1024);
+  if (payloadMode === 'large') sizes.push(1024 * 1024 * 10);
 
   const totalTests = APPROACHES.filter(a => a.supported).length * sizes.length * concurrencies.length;
   let done = 0;
